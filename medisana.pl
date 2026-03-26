@@ -31,13 +31,17 @@ use Getopt::Long;
 
 my %opts = (
     device            => undef,
+    scan_seconds      => 0,
     addr_type         => 'public',
+    mode              => 'bs430',
     connect_timeout   => 5,
     debug             => 0,
     service_uuid      => '181d',
     weight_char_uuid  => '2a98',
     battery_char_uuid => '2a19',
     measure_timeout_s => 10,
+    bs444_listen_s    => 30,
+    bs444_timeoffset  => 1,
     wait_seconds      => 0,
     dump_gatt         => 0,
 );
@@ -46,12 +50,16 @@ my ($do_measure, $do_battery) = (0, 0);
 
 GetOptions(
     'device|d=s'             => \$opts{device},
+    'scan-seconds=f'         => \$opts{scan_seconds},
     'addr-type=s'            => \$opts{addr_type},
+    'mode=s'                 => \$opts{mode},
     'connect-timeout=f'       => \$opts{connect_timeout},
     'service-uuid=s'          => \$opts{service_uuid},
     'weight-char-uuid=s'      => \$opts{weight_char_uuid},
     'battery-char-uuid=s'     => \$opts{battery_char_uuid},
     'measure-timeout=f'       => \$opts{measure_timeout_s},
+    'bs444-listen-seconds=f'  => \$opts{bs444_listen_s},
+    'bs444-timeoffset!'       => \$opts{bs444_timeoffset},
     'wait-seconds=f'          => \$opts{wait_seconds},
     'dump-gatt'               => \$opts{dump_gatt},
     'measure'                 => \$do_measure,
@@ -60,18 +68,45 @@ GetOptions(
     'help|h'                  => sub { print_usage(); exit 0; },
 ) or do { print_usage(); exit 1; };
 
-unless ($opts{device}) {
-    print STDERR "Error: -d / --device is required\n";
-    print_usage();
+if ($opts{scan_seconds} < 0) {
+    print STDERR "Error: --scan-seconds must be >= 0\n";
     exit 1;
 }
-unless ($opts{device} =~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
+if ($opts{device} && $opts{device} !~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
     print STDERR "Error: Invalid Bluetooth address format\n";
     exit 1;
 }
 if ($opts{addr_type} !~ /^(?:public|random)$/i) {
     print STDERR "Error: --addr-type must be 'public' or 'random'\n";
     exit 1;
+}
+if ($opts{mode} !~ /^(?:bs430|bs444|bs430-legacy)$/i) {
+    print STDERR "Error: --mode must be 'bs430', 'bs444', or 'bs430-legacy'\n";
+    exit 1;
+}
+$opts{mode} = lc $opts{mode};
+
+# Assume BS430 behaves like BS444 unless explicitly forced to legacy mode.
+if ($opts{mode} eq 'bs430') {
+    $opts{mode} = 'bs444';
+} elsif ($opts{mode} eq 'bs430-legacy') {
+    $opts{mode} = 'bs430';
+}
+
+if (!$opts{device}) {
+    if ($opts{scan_seconds} > 0) {
+        my $found = auto_find_target_device(\%opts);
+        unless ($found) {
+            print STDERR "Error: no matching device found during scan\n";
+            exit 1;
+        }
+        $opts{device} = $found;
+        print "Auto-selected device: $found\n";
+    } else {
+        print STDERR "Error: -d / --device is required (or use --scan-seconds)\n";
+        print_usage();
+        exit 1;
+    }
 }
 
 for my $k (qw(service_uuid weight_char_uuid battery_char_uuid)) {
@@ -121,6 +156,8 @@ use constant {
     ATT_WRITE_REQ             => 0x12,
     ATT_WRITE_RSP             => 0x13,
     ATT_HANDLE_VALUE_NOTIF    => 0x1B,
+    ATT_HANDLE_VALUE_IND      => 0x1D,
+    ATT_HANDLE_VALUE_CFM      => 0x1E,
     ATT_EXCHANGE_MTU_REQ      => 0x02,
     ATT_EXCHANGE_MTU_RSP      => 0x03,
     ATT_ERROR_RSP             => 0x01,
@@ -138,12 +175,28 @@ sub new {
         connect_timeout  => $o{connect_timeout} // 5,
         wait_seconds     => $o{wait_seconds} // 0,
         debug            => $o{debug} // 0,
+        mode             => $o{mode} // 'bs430',
 
         service_uuid     => hex($o{service_uuid}),
         weight_uuid      => hex($o{weight_char_uuid}),
         battery_uuid     => hex($o{battery_char_uuid}),
         measure_timeout  => $o{measure_timeout_s} // 10,
+        bs444_listen_s   => $o{bs444_listen_s} // 30,
+        bs444_timeoffset => $o{bs444_timeoffset} ? 1 : 0,
         dump_gatt        => $o{dump_gatt} // 0,
+
+        bs444_service_uuid => '000078b200001000800000805f9b34fb',
+        bs444_person_uuid  => '00008a8200001000800000805f9b34fb',
+        bs444_weight_uuid  => '00008a2100001000800000805f9b34fb',
+        bs444_body_uuid    => '00008a2200001000800000805f9b34fb',
+        bs444_command_uuid => '00008a8100001000800000805f9b34fb',
+
+        bs444_service_start => 0,
+        bs444_service_end   => 0,
+        bs444_person_handle => 0,
+        bs444_weight_handle => 0,
+        bs444_body_handle   => 0,
+        bs444_command_handle => 0,
 
         socket           => undef,
         handle_weight    => 0,
@@ -164,6 +217,12 @@ sub run {
     print "=============================\n\n";
     print "Device: $self->{device}\n";
 
+    if ($self->{mode} eq 'bs444') {
+        print "Mode:   BS444\n";
+    } else {
+        print "Mode:   BS430\n";
+    }
+
     unless ($self->ble_connect_with_retry()) {
         print STDERR "ERROR: BLE connection failed\n";
         return 1;
@@ -173,6 +232,13 @@ sub run {
         $self->ble_disconnect();
         return 0;
     }
+
+    if ($self->{mode} eq 'bs444') {
+        my $ok = $self->run_bs444();
+        $self->ble_disconnect();
+        return $ok ? 0 : 1;
+    }
+
     unless ($self->discover_handles(
         need_weight  => $todo{measure},
         need_battery => $todo{battery},
@@ -212,6 +278,21 @@ sub run {
 
     $self->ble_disconnect();
     return $rc;
+}
+
+sub run_bs444 {
+    my ($self) = @_;
+
+    unless ($self->discover_bs444_handles()) {
+        print STDERR "ERROR: Could not discover BS444 service/characteristics\n";
+        return 0;
+    }
+
+    $self->exchange_mtu(160);
+    $self->subscribe_bs444_indications();
+    $self->send_bs444_command();
+    $self->listen_bs444_indications();
+    return 1;
 }
 
 # ============================================================================
@@ -342,6 +423,263 @@ sub dump_gatt {
     }
 
     print "No primary service response\n" unless $found;
+}
+
+sub discover_bs444_handles {
+    my ($self) = @_;
+
+    my ($svc_start, $svc_end) = $self->find_service_range($self->{bs444_service_uuid});
+    unless ($svc_start) {
+        $self->debug('BS444 service 78b2 not found');
+        return 0;
+    }
+    $self->{bs444_service_start} = $svc_start;
+    $self->{bs444_service_end}   = $svc_end;
+    $self->debug(sprintf('BS444 service: 0x%04X-0x%04X', $svc_start, $svc_end));
+
+    my $start = $svc_start;
+    while ($start <= $svc_end) {
+        my $crsp = $self->att_request(
+            pack('C S< S< S<', ATT_READ_BY_TYPE_REQ, $start, $svc_end, GATT_CHARACTERISTIC_UUID),
+            2.0
+        );
+        last unless defined $crsp && length($crsp) >= 2;
+        my $cop = ord(substr($crsp, 0, 1));
+        last if $cop != ATT_READ_BY_TYPE_RSP;
+
+        my $elen = ord(substr($crsp, 1, 1));
+        last if $elen < 7;
+
+        my ($pos, $last_decl) = (2, $start);
+        while ($pos + $elen <= length($crsp)) {
+            my $e = substr($crsp, $pos, $elen);
+            my $decl = unpack('S<', substr($e, 0, 2));
+            my $val  = unpack('S<', substr($e, 3, 2));
+
+            my $uuid = '';
+            if ($elen == 7) {
+                $uuid = sprintf('%04x', unpack('S<', substr($e, 5, 2)));
+            } elsif ($elen == 21) {
+                my @b = unpack('C16', substr($e, 5, 16));
+                $uuid = join('', map { sprintf('%02x', $_) } reverse @b);
+            }
+
+            $self->debug(sprintf('  BS444 char uuid=%s handle=0x%04X', $uuid || '?', $val));
+
+            if ($uuid eq $self->{bs444_person_uuid}) {
+                $self->{bs444_person_handle} = $val;
+            } elsif ($uuid eq $self->{bs444_weight_uuid}) {
+                $self->{bs444_weight_handle} = $val;
+            } elsif ($uuid eq $self->{bs444_body_uuid}) {
+                $self->{bs444_body_handle} = $val;
+            } elsif ($uuid eq $self->{bs444_command_uuid}) {
+                $self->{bs444_command_handle} = $val;
+            }
+
+            $last_decl = $decl;
+            $pos += $elen;
+        }
+        $start = $last_decl + 1;
+    }
+
+    $self->debug(sprintf(
+        'BS444 handles: person=0x%04X weight=0x%04X body=0x%04X command=0x%04X',
+        $self->{bs444_person_handle},
+        $self->{bs444_weight_handle},
+        $self->{bs444_body_handle},
+        $self->{bs444_command_handle}
+    ));
+
+    return $self->{bs444_person_handle}
+        && $self->{bs444_weight_handle}
+        && $self->{bs444_body_handle}
+        && $self->{bs444_command_handle};
+}
+
+sub find_service_range {
+    my ($self, $target_uuid) = @_;
+    my $start_h = 0x0001;
+
+    while ($start_h <= 0xFFFF) {
+        my $rsp = $self->att_request(
+            pack('C S< S< S<', ATT_READ_BY_GROUP_TYPE_REQ, $start_h, 0xFFFF, GATT_PRIMARY_SERVICE_UUID),
+            3.0
+        );
+        last unless defined $rsp && length($rsp) >= 2
+                    && ord(substr($rsp, 0, 1)) == ATT_READ_BY_GROUP_TYPE_RSP;
+
+        my $elen     = ord(substr($rsp, 1, 1));
+        my $pos      = 2;
+        my $last_end = $start_h;
+        last if $elen < 6;
+
+        while ($pos + $elen <= length($rsp)) {
+            my $e = substr($rsp, $pos, $elen);
+            my ($svc_start, $svc_end) = unpack('S< S<', substr($e, 0, 4));
+
+            my $uuid = '';
+            if ($elen == 6) {
+                $uuid = sprintf('%04x', unpack('S<', substr($e, 4, 2)));
+            } elsif ($elen == 20) {
+                my @b = unpack('C16', substr($e, 4, 16));
+                $uuid = join('', map { sprintf('%02x', $_) } reverse @b);
+            }
+
+            if ($uuid eq lc($target_uuid)) {
+                return ($svc_start, $svc_end);
+            }
+
+            $last_end = $svc_end;
+            $pos += $elen;
+        }
+
+        last if $last_end >= 0xFFFF;
+        $start_h = $last_end + 1;
+    }
+
+    return (0, 0);
+}
+
+sub has_target_service {
+    my ($self) = @_;
+    if ($self->{mode} eq 'bs444') {
+        my ($s, $e) = $self->find_service_range($self->{bs444_service_uuid});
+        return $s ? 1 : 0;
+    }
+
+    my $rsp = $self->att_request(
+        pack('C S< S< S<', ATT_FIND_BY_TYPE_REQ, 0x0001, 0xFFFF,
+            GATT_PRIMARY_SERVICE_UUID, $self->{service_uuid}),
+        2.0
+    );
+    return (defined $rsp && length($rsp) >= 5
+        && ord(substr($rsp, 0, 1)) == ATT_FIND_BY_TYPE_RSP) ? 1 : 0;
+}
+
+sub subscribe_bs444_indications {
+    my ($self) = @_;
+    for my $h ($self->{bs444_person_handle}, $self->{bs444_weight_handle}, $self->{bs444_body_handle}) {
+        next unless $h;
+        my $cccd = $h + 1;
+        my $req = pack('C S< S<', ATT_WRITE_REQ, $cccd, 0x0002);
+        my $rsp = $self->att_request($req, 2.0);
+        my $ok  = defined($rsp) && length($rsp) >= 1 && ord(substr($rsp, 0, 1)) == ATT_WRITE_RSP;
+        $self->debug($ok ? sprintf('Indications enabled (cccd=0x%04X)', $cccd)
+                         : sprintf('Indication enable failed (cccd=0x%04X)', $cccd));
+    }
+}
+
+sub send_bs444_command {
+    my ($self) = @_;
+    my $h = $self->{bs444_command_handle};
+    return unless $h;
+
+    my $ts = time();
+    $ts -= 1262304000 if $self->{bs444_timeoffset};
+    my $payload = pack('C V', 0x02, $ts & 0xFFFFFFFF);
+
+    my $req = pack('C S<', ATT_WRITE_REQ, $h) . $payload;
+    my $rsp = $self->att_request($req, 2.0);
+    my $ok  = defined($rsp) && length($rsp) >= 1 && ord(substr($rsp, 0, 1)) == ATT_WRITE_RSP;
+    $self->debug($ok ? 'BS444 command sent' : 'BS444 command write failed');
+}
+
+sub listen_bs444_indications {
+    my ($self) = @_;
+
+    my $person_data_h = $self->{bs444_person_handle} ? ($self->{bs444_person_handle} - 1) : 0;
+    my $weight_data_h = $self->{bs444_weight_handle} ? ($self->{bs444_weight_handle} - 1) : 0;
+    my $body_data_h   = $self->{bs444_body_handle} ? ($self->{bs444_body_handle} - 1) : 0;
+
+    my $deadline = time() + $self->{bs444_listen_s};
+    print sprintf("Listening for BS444 data for %.0f seconds...\n", $self->{bs444_listen_s});
+
+    while (1) {
+        my $remaining = $deadline - time();
+        last if $remaining <= 0;
+
+        my $rin = '';
+        vec($rin, fileno($self->{socket}), 1) = 1;
+        my $n = select(my $rout = $rin, undef, undef, $remaining);
+        last unless defined($n) && $n > 0;
+
+        my ($raw, $r) = ('');
+        $r = sysread($self->{socket}, $raw, 512);
+        last unless defined($r) && $r > 0;
+
+        my $op = ord(substr($raw, 0, 1));
+        next unless $op == ATT_HANDLE_VALUE_NOTIF || $op == ATT_HANDLE_VALUE_IND;
+
+        if ($op == ATT_HANDLE_VALUE_IND) {
+            syswrite($self->{socket}, pack('C', ATT_HANDLE_VALUE_CFM));
+        }
+
+        next if length($raw) < 4;
+        my $h = unpack('S<', substr($raw, 1, 2));
+        my @v = unpack('C*', substr($raw, 3));
+
+        if ($person_data_h && $h == $person_data_h) {
+            my $d = $self->decode_bs444_person(\@v);
+            next unless $d->{valid};
+            printf "Person: id=%d sex=%s age=%d size=%.2fm activity=%s\n",
+                $d->{person}, $d->{male} ? 'male' : 'female', $d->{age}, $d->{size_m},
+                $d->{high_activity} ? 'high' : 'normal';
+        } elsif ($weight_data_h && $h == $weight_data_h) {
+            my $d = $self->decode_bs444_weight(\@v);
+            next unless $d->{valid};
+            printf "Weight: %.2f kg (person=%d ts=%d)\n", $d->{weight}, $d->{person}, $d->{timestamp};
+        } elsif ($body_data_h && $h == $body_data_h) {
+            my $d = $self->decode_bs444_body(\@v);
+            next unless $d->{valid};
+            printf "Body: person=%d kcal=%d fat=%.1f tbw=%.1f muscle=%.1f bone=%.1f ts=%d\n",
+                $d->{person}, $d->{kcal}, $d->{fat}, $d->{tbw}, $d->{muscle}, $d->{bone}, $d->{timestamp};
+        } else {
+            $self->debug(sprintf('Unhandled BS444 packet handle=0x%04X len=%d', $h, scalar(@v)));
+        }
+    }
+}
+
+sub decode_bs444_person {
+    my ($self, $v) = @_;
+    return { valid => 0 } unless @$v >= 9;
+    return {
+        valid         => ($v->[0] == 0x84) ? 1 : 0,
+        person        => $v->[2],
+        male          => ($v->[4] == 1) ? 1 : 0,
+        age           => $v->[5],
+        size_m        => $v->[6] / 100.0,
+        high_activity => ($v->[8] == 3) ? 1 : 0,
+    };
+}
+
+sub decode_bs444_weight {
+    my ($self, $v) = @_;
+    return { valid => 0 } unless @$v >= 14;
+    my $ts = ($v->[8] << 24) | ($v->[7] << 16) | ($v->[6] << 8) | $v->[5];
+    $ts += 1262304000 if $self->{bs444_timeoffset};
+    return {
+        valid     => ($v->[0] == 0x1d) ? 1 : 0,
+        weight    => (($v->[2] << 8) | $v->[1]) / 100.0,
+        timestamp => $ts,
+        person    => $v->[13],
+    };
+}
+
+sub decode_bs444_body {
+    my ($self, $v) = @_;
+    return { valid => 0 } unless @$v >= 16;
+    my $ts = ($v->[4] << 24) | ($v->[3] << 16) | ($v->[2] << 8) | $v->[1];
+    $ts += 1262304000 if $self->{bs444_timeoffset};
+    return {
+        valid     => ($v->[0] == 0x6f) ? 1 : 0,
+        timestamp => $ts,
+        person    => $v->[5],
+        kcal      => ($v->[7] << 8) | $v->[6],
+        fat       => (0x0fff & (($v->[9] << 8) | $v->[8])) / 10.0,
+        tbw       => (0x0fff & (($v->[11] << 8) | $v->[10])) / 10.0,
+        muscle    => (0x0fff & (($v->[13] << 8) | $v->[12])) / 10.0,
+        bone      => (0x0fff & (($v->[15] << 8) | $v->[14])) / 10.0,
+    };
 }
 
 sub discover_handles {
@@ -548,6 +886,64 @@ sub debug {
 
 package main;
 
+sub probe_candidate_device {
+    my ($opts, $mac) = @_;
+
+    # Try requested address type first, then fallback quickly to the other type.
+    my @atypes = ($opts->{addr_type});
+    push @atypes, grep { $_ ne $opts->{addr_type} } qw(public random);
+
+    for my $atype (@atypes) {
+        my %probe_opts = %{$opts};
+        $probe_opts{device} = $mac;
+        $probe_opts{addr_type} = $atype;
+        $probe_opts{wait_seconds} = 0;
+        # Keep connect attempts short for short advertising windows.
+        $probe_opts{connect_timeout} = ($probe_opts{connect_timeout} > 1.5)
+            ? 1.5 : $probe_opts{connect_timeout};
+
+        my $probe = Medisana::BS430->new(%probe_opts);
+        next unless $probe->ble_connect();
+
+        my $match = $probe->has_target_service();
+        $probe->ble_disconnect();
+        return 1 if $match;
+    }
+
+    return 0;
+}
+
+sub auto_find_target_device {
+    my ($opts) = @_;
+
+    my $seconds = int($opts->{scan_seconds});
+    print "Scanning for BLE devices for $seconds seconds...\n";
+
+    my @cmd = ('bash', '-lc', "bluetoothctl --timeout $seconds scan on 2>&1");
+    open(my $fh, '-|', @cmd) or return undef;
+
+    my %seen;
+    my $seen_count = 0;
+    while (my $line = <$fh>) {
+        while ($line =~ /([0-9A-F]{2}(?::[0-9A-F]{2}){5})/ig) {
+            my $mac = uc $1;
+            next if $seen{$mac}++;
+            $seen_count++;
+
+            print "Seen $mac -> probing now...\n";
+            if (probe_candidate_device($opts, $mac)) {
+                close $fh;
+                return $mac;
+            }
+        }
+    }
+    close $fh;
+
+    print "Scan candidates seen: $seen_count\n";
+
+    return undef;
+}
+
 sub print_usage {
     print <<"EOF";
 Usage: $0 -d AA:BB:CC:DD:EE:FF [actions] [options]
@@ -557,13 +953,17 @@ Actions (one or more; defaults to --measure --battery):
   --battery       Show battery level
 
 Required:
-  -d, --device ADDR       BLE MAC address
+    -d, --device ADDR          BLE MAC address
+            --scan-seconds SEC     Scan and auto-select first matching device
 
 Options:
   --addr-type TYPE        public|random (default: public)
+    --mode MODE             bs430|bs444|bs430-legacy (default: bs430 -> bs444)
   --connect-timeout SEC   Connect timeout in seconds (default: 5)
     --wait-seconds SEC      Keep retrying connect for this many seconds (default: 0)
   --measure-timeout SEC   Timeout waiting for measurement (default: 10)
+    --bs444-listen-seconds SEC  Listen window in BS444 mode (default: 30)
+    --[no-]bs444-timeoffset     Add 2010 offset to scale timestamps (default: on)
     --dump-gatt             Print discovered primary services and exit
   -v, --debug             Verbose output
   -h, --help              Show this help
@@ -576,8 +976,12 @@ GATT UUID overrides (4-hex-digit):
 Examples:
   $0 -d C7:AB:CD:12:34:56 --measure
   $0 -d C7:AB:CD:12:34:56 --battery
+    $0 -d C7:AB:CD:12:34:56 --mode bs430 -v
+    $0 --scan-seconds 20 --mode bs430 --addr-type public -v
   $0 -d C7:AB:CD:12:34:56 --measure --battery
     $0 -d C7:AB:CD:12:34:56 --addr-type random --wait-seconds 30 --dump-gatt -v
+    $0 -d C7:AB:CD:12:34:56 --mode bs444 --addr-type public --bs444-listen-seconds 30 -v
+    $0 -d C7:AB:CD:12:34:56 --mode bs430-legacy --measure --battery -v
   $0 -d C7:AB:CD:12:34:56 --measure --battery -v
 
 Notes:

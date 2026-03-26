@@ -38,6 +38,8 @@ my %opts = (
     weight_char_uuid  => '2a98',
     battery_char_uuid => '2a19',
     measure_timeout_s => 10,
+    wait_seconds      => 0,
+    dump_gatt         => 0,
 );
 
 my ($do_measure, $do_battery) = (0, 0);
@@ -50,6 +52,8 @@ GetOptions(
     'weight-char-uuid=s'      => \$opts{weight_char_uuid},
     'battery-char-uuid=s'     => \$opts{battery_char_uuid},
     'measure-timeout=f'       => \$opts{measure_timeout_s},
+    'wait-seconds=f'          => \$opts{wait_seconds},
+    'dump-gatt'               => \$opts{dump_gatt},
     'measure'                 => \$do_measure,
     'battery'                 => \$do_battery,
     'debug|v+'                => \$opts{debug},
@@ -108,6 +112,8 @@ use constant {
 
     ATT_FIND_BY_TYPE_REQ      => 0x06,
     ATT_FIND_BY_TYPE_RSP      => 0x07,
+    ATT_READ_BY_GROUP_TYPE_REQ => 0x10,
+    ATT_READ_BY_GROUP_TYPE_RSP => 0x11,
     ATT_READ_BY_TYPE_REQ      => 0x08,
     ATT_READ_BY_TYPE_RSP      => 0x09,
     ATT_READ_REQ              => 0x0A,
@@ -130,12 +136,14 @@ sub new {
         device           => $o{device},
         addr_type        => lc($o{addr_type} // 'public'),
         connect_timeout  => $o{connect_timeout} // 5,
+        wait_seconds     => $o{wait_seconds} // 0,
         debug            => $o{debug} // 0,
 
         service_uuid     => hex($o{service_uuid}),
         weight_uuid      => hex($o{weight_char_uuid}),
         battery_uuid     => hex($o{battery_char_uuid}),
         measure_timeout  => $o{measure_timeout_s} // 10,
+        dump_gatt        => $o{dump_gatt} // 0,
 
         socket           => undef,
         handle_weight    => 0,
@@ -156,11 +164,19 @@ sub run {
     print "=============================\n\n";
     print "Device: $self->{device}\n";
 
-    unless ($self->ble_connect()) {
+    unless ($self->ble_connect_with_retry()) {
         print STDERR "ERROR: BLE connection failed\n";
         return 1;
     }
-    unless ($self->discover_handles()) {
+    if ($self->{dump_gatt}) {
+        $self->dump_gatt();
+        $self->ble_disconnect();
+        return 0;
+    }
+    unless ($self->discover_handles(
+        need_weight  => $todo{measure},
+        need_battery => $todo{battery},
+    )) {
         print STDERR "ERROR: 181D service / measurement handles not found\n";
         $self->ble_disconnect();
         return 1;
@@ -249,8 +265,87 @@ sub ble_connect {
     return 1;
 }
 
-sub discover_handles {
+sub ble_connect_with_retry {
     my ($self) = @_;
+    return 1 if $self->ble_connect();
+
+    my $wait = $self->{wait_seconds} // 0;
+    return 0 if $wait <= 0;
+
+    my $deadline = time() + $wait;
+    while (time() < $deadline) {
+        select(undef, undef, undef, 0.7);
+        return 1 if $self->ble_connect();
+    }
+    return 0;
+}
+
+sub dump_gatt {
+    my ($self) = @_;
+
+    # Read and print device name first (characteristic 0x2A00 inside service 0x1800)
+    my $name_rsp = $self->att_request(
+        pack('C S< S< S<', ATT_READ_BY_TYPE_REQ, 0x0001, 0x000B, 0x2A00),
+        2.0
+    );
+    if (defined $name_rsp && length($name_rsp) >= 4
+            && ord(substr($name_rsp, 0, 1)) == ATT_READ_BY_TYPE_RSP) {
+        my $elen  = ord(substr($name_rsp, 1, 1));
+        my $voff  = 4;  # [op][elen][decl_handle(2)] then value starts at byte 4
+        my $vlen  = $elen - 2;  # subtract declaration handle bytes
+        if ($elen >= 4 && length($name_rsp) >= 2 + $elen && $vlen > 0) {
+            my $name = substr($name_rsp, 2 + 2, $vlen);
+            $name =~ s/[^\x20-\x7E]//g;
+            print "Device name: $name\n" if length($name);
+        }
+    }
+
+    print "GATT services (primary)\n";
+    print "=======================\n";
+
+    # Paginate through all services (ATT_READ_BY_GROUP_TYPE_RSP paginates at MTU boundary)
+    my $start_h = 0x0001;
+    my $found   = 0;
+    while ($start_h <= 0xFFFF) {
+        my $rsp = $self->att_request(
+            pack('C S< S< S<', ATT_READ_BY_GROUP_TYPE_REQ, $start_h, 0xFFFF, GATT_PRIMARY_SERVICE_UUID),
+            3.0
+        );
+        last unless defined $rsp && length($rsp) >= 2
+                    && ord(substr($rsp, 0, 1)) == ATT_READ_BY_GROUP_TYPE_RSP;
+
+        my $elen     = ord(substr($rsp, 1, 1));
+        my $pos      = 2;
+        my $last_end = $start_h;
+        last if $elen < 6;
+
+        while ($pos + $elen <= length($rsp)) {
+            my $e = substr($rsp, $pos, $elen);
+            my ($svc_start, $svc_end) = unpack('S< S<', substr($e, 0, 4));
+
+            my $uuid = 'unknown';
+            if ($elen == 6) {
+                $uuid = sprintf('%04x', unpack('S<', substr($e, 4, 2)));
+            } elsif ($elen == 20) {
+                my @b = unpack('C16', substr($e, 4, 16));
+                $uuid = join('', map { sprintf('%02x', $_) } reverse @b);
+            }
+
+            printf "- 0x%04X-0x%04X  UUID %s\n", $svc_start, $svc_end, $uuid;
+            $last_end = $svc_end;
+            $found++;
+            $pos += $elen;
+        }
+
+        last if $last_end >= 0xFFFF;
+        $start_h = $last_end + 1;
+    }
+
+    print "No primary service response\n" unless $found;
+}
+
+sub discover_handles {
+    my ($self, %need) = @_;
 
     my $rsp = $self->att_request(
         pack('C S< S< S<',
@@ -304,7 +399,12 @@ sub discover_handles {
     $self->debug(sprintf('weight=0x%04X (cccd=0x%04X)  battery=0x%04X (cccd=0x%04X)',
         $self->{handle_weight}, $self->{handle_weight_cccd},
         $self->{handle_battery}, $self->{handle_battery_cccd}));
-    return $self->{handle_weight} ? 1 : 0;
+
+    my $need_weight  = $need{need_weight} ? 1 : 0;
+    my $need_battery = $need{need_battery} ? 1 : 0;
+    my $ok_weight    = !$need_weight  || $self->{handle_weight};
+    my $ok_battery   = !$need_battery || $self->{handle_battery};
+    return ($ok_weight && $ok_battery) ? 1 : 0;
 }
 
 sub ble_disconnect {
@@ -462,7 +562,9 @@ Required:
 Options:
   --addr-type TYPE        public|random (default: public)
   --connect-timeout SEC   Connect timeout in seconds (default: 5)
+    --wait-seconds SEC      Keep retrying connect for this many seconds (default: 0)
   --measure-timeout SEC   Timeout waiting for measurement (default: 10)
+    --dump-gatt             Print discovered primary services and exit
   -v, --debug             Verbose output
   -h, --help              Show this help
 
@@ -475,6 +577,7 @@ Examples:
   $0 -d C7:AB:CD:12:34:56 --measure
   $0 -d C7:AB:CD:12:34:56 --battery
   $0 -d C7:AB:CD:12:34:56 --measure --battery
+    $0 -d C7:AB:CD:12:34:56 --addr-type random --wait-seconds 30 --dump-gatt -v
   $0 -d C7:AB:CD:12:34:56 --measure --battery -v
 
 Notes:
